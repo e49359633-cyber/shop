@@ -35,15 +35,15 @@ async def start_cmd(message: types.Message):
         kb.append([types.KeyboardButton(text="➕ Добавить базу")])
     
     keyboard = types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
-    await message.answer("✅ Бот обновлен и готов к работе!", reply_markup=keyboard)
+    await message.answer("✅ Бот готов! Теперь данные будут приходить без задержек.", reply_markup=keyboard)
 
-# --- ИСПРАВЛЕННАЯ ПОКУПКА ---
+# --- ИСПРАВЛЕННАЯ ЛОГИКА ВЫДАЧИ ---
 @dp.message(F.text == "🛒 Купить аккаунт")
 async def buy_account(message: types.Message):
     pool = await get_db_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # Удаляем и забираем данные
+            # Удаляем и забираем данные из БД
             row = await conn.fetchrow('''
                 DELETE FROM accounts 
                 WHERE id = (SELECT id FROM accounts ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED) 
@@ -53,17 +53,18 @@ async def buy_account(message: types.Message):
             if row:
                 acc_data = row['data']
                 try:
-                    # Используем HTML вместо Markdown, чтобы не было ошибок с символами . и @
+                    # Используем HTML-разметку. Она не ломается от точек и собак.
+                    # Тег <code> делает текст копируемым по нажатию.
                     await message.answer(
                         f"✅ <b>Ваш аккаунт куплен!</b>\n\n"
                         f"<code>{acc_data}</code>\n\n"
-                        f"⚠️ <i>Данные удалены из базы. Сохраните их!</i>", 
+                        f"⚠️ <i>Данные удалены из базы.</i>", 
                         parse_mode="HTML"
                     )
                 except Exception as e:
                     logging.error(f"Ошибка отправки: {e}")
-                    # Если вдруг не отправилось красиво, отправляем простым текстом
-                    await message.answer(f"Ваш аккаунт (простой текст):\n{acc_data}")
+                    # Если HTML не прошел, отправляем голым текстом (100% дойдет)
+                    await message.answer(f"✅ Ваш аккаунт:\n{acc_data}")
             else:
                 await message.answer("❌ Извините, товар закончился.")
 
