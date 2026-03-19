@@ -35,15 +35,14 @@ async def start_cmd(message: types.Message):
         kb.append([types.KeyboardButton(text="➕ Добавить базу")])
     
     keyboard = types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
-    await message.answer("✅ Бот готов! Теперь данные будут приходить без задержек.", reply_markup=keyboard)
+    await message.answer("Бот перезапущен. Пробуем голый текст.", reply_markup=keyboard)
 
-# --- ИСПРАВЛЕННАЯ ЛОГИКА ВЫДАЧИ ---
+# --- САМАЯ ПРОСТАЯ ВЫДАЧА (БЕЗ ФОРМАТИРОВАНИЯ) ---
 @dp.message(F.text == "🛒 Купить аккаунт")
 async def buy_account(message: types.Message):
     pool = await get_db_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # Удаляем и забираем данные из БД
             row = await conn.fetchrow('''
                 DELETE FROM accounts 
                 WHERE id = (SELECT id FROM accounts ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED) 
@@ -51,40 +50,27 @@ async def buy_account(message: types.Message):
             ''')
             
             if row:
-                acc_data = row['data']
-                try:
-                    # Используем HTML-разметку. Она не ломается от точек и собак.
-                    # Тег <code> делает текст копируемым по нажатию.
-                    await message.answer(
-                        f"✅ <b>Ваш аккаунт куплен!</b>\n\n"
-                        f"<code>{acc_data}</code>\n\n"
-                        f"⚠️ <i>Данные удалены из базы.</i>", 
-                        parse_mode="HTML"
-                    )
-                except Exception as e:
-                    logging.error(f"Ошибка отправки: {e}")
-                    # Если HTML не прошел, отправляем голым текстом (100% дойдет)
-                    await message.answer(f"✅ Ваш аккаунт:\n{acc_data}")
+                # ОТПРАВЛЯЕМ ПРОСТО ТЕКСТ. БЕЗ ПАРАМЕТРОВ.
+                await message.answer(f"Твой товар:\n{row['data']}")
             else:
-                await message.answer("❌ Извините, товар закончился.")
+                await message.answer("Товар закончился.")
 
 @dp.message(F.text == "📊 Наличие")
 async def check_stock(message: types.Message):
     pool = await get_db_pool()
     count = await pool.fetchval("SELECT COUNT(*) FROM accounts")
-    await message.answer(f"📦 В наличии: {count} шт.")
+    await message.answer(f"В наличии: {count} шт.")
 
 @dp.message(F.text == "➕ Добавить базу")
 async def admin_add(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS: return
     await state.set_state(AdminStates.adding_accounts)
-    await message.answer("Отправь список аккаунтов (каждый с новой строки).")
+    await message.answer("Кидай список.")
 
 @dp.message(AdminStates.adding_accounts)
 async def process_adding(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS: return
     accounts = [a.strip() for a in message.text.split('\n') if a.strip()]
-    
     pool = await get_db_pool()
     added_count = 0
     async with pool.acquire() as conn:
@@ -92,9 +78,8 @@ async def process_adding(message: types.Message, state: FSMContext):
             res = await conn.execute("INSERT INTO accounts (data) VALUES ($1) ON CONFLICT DO NOTHING", acc)
             if res == "INSERT 0 1":
                 added_count += 1
-    
     await state.clear()
-    await message.answer(f"✅ Успешно добавлено: {added_count}")
+    await message.answer(f"Добавлено: {added_count}")
 
 async def main():
     logging.basicConfig(level=logging.INFO)
