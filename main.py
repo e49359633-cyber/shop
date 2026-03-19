@@ -1,108 +1,81 @@
 import asyncio
-import logging
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 import asyncpg
 
-# --- НАСТРОЙКИ ---
-# Укажи свой токен
-API_TOKEN = '8717755678:AAFxBTzyDghHPLYOstlvkeNsUjgBStP3KHg' 
-ADMIN_IDS = [8209617821, 8384467554] 
-DATABASE_URL = 'postgresql://bothost_db_29f14895d3aa:tbdVGmS3JoNrcauznAFgzNTJgefFJE3xE33flLLZY5M@node1.pghost.ru:32854/bothost_db_29f14895d3aa'
+# Твои данные
+API_TOKEN = '8717755678:AAFxBTzyDghHPLYOstlvkeNsUjgBStP3KHg'
+ADMIN_IDS = [8209617821, 8384467554]
+DB_URL = 'postgresql://bothost_db_29f14895d3aa:tbdVGmS3JoNrcauznAFgzNTJgefFJE3xE33flLLZY5M@node1.pghost.ru:32854/bothost_db_29f14895d3aa'
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
-class AdminStates(StatesGroup):
-    adding_accounts = State()
+# --- Логика Базы Данных ---
 
-db_pool = None
+async def buy_account():
+    """Находит 1 аккаунт, помечает его как проданный и возвращает данные"""
+    conn = await asyncpg.connect(DB_URL)
+    # Используем UPDATE с RETURNING, чтобы атомарно забрать и пометить аккаунт
+    row = await conn.fetchrow('''
+        UPDATE accounts 
+        SET is_sold = TRUE 
+        WHERE id = (
+            SELECT id FROM accounts WHERE is_sold = FALSE LIMIT 1 FOR UPDATE SKIP LOCKED
+        ) 
+        RETURNING data
+    ''')
+    await conn.close()
+    return row['data'] if row else None
 
-async def get_db_pool():
-    global db_pool
-    if db_pool is None:
-        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
-    return db_pool
+# --- Клавиатуры ---
 
-# --- ОБРАБОТЧИКИ ---
+def get_main_kb():
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="🛒 Купить почту (1 шт.)", callback_data="buy_mail"))
+    return builder.as_markup()
+
+# --- Хендлеры ---
 
 @dp.message(Command("start"))
-async def start_cmd(message: types.Message):
-    kb = [
-        [types.KeyboardButton(text="🛒 Купить аккаунт")],
-        [types.KeyboardButton(text="📊 Наличие")]
-    ]
-    if message.from_user.id in ADMIN_IDS:
-        kb.append([types.KeyboardButton(text="➕ Добавить базу")])
-    
-    keyboard = types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+async def cmd_start(message: types.Message):
     await message.answer(
-        "👋 <b>Добро пожаловать!</b>\nИспользуйте кнопки меню для работы с ботом.", 
-        reply_markup=keyboard,
-        parse_mode="HTML"
+        "👋 Привет! Добро пожаловать в магазин почт Mail.ru.\n\n"
+        "Нажми на кнопку ниже, чтобы получить аккаунт.",
+        reply_markup=get_main_kb()
     )
 
-@dp.message(F.text == "🛒 Купить аккаунт")
-async def buy_account(message: types.Message):
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            row = await conn.fetchrow('''
-                DELETE FROM accounts 
-                WHERE id = (SELECT id FROM accounts ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED) 
-                RETURNING data
-            ''')
-            
-            if row:
-                acc_data = row['data']
-                # Используем HTML. Тег <code> делает текст копируемым по нажатию.
-                text = (
-                    f"✅ <b>Ваш аккаунт куплен!</b>\n\n"
-                    f"<code>{acc_data}</code>\n\n"
-                    f"⚠️ <i>Данные удалены из базы.</i>"
-                )
-                try:
-                    await message.answer(text, parse_mode="HTML")
-                except Exception as e:
-                    logging.error(f"Ошибка отправки: {e}")
-                    # Если HTML упал, шлем простым текстом
-                    await message.answer(f"Ваш аккаунт:\n{acc_data}")
-            else:
-                await message.answer("❌ Извините, товар закончился.")
-
-@dp.message(F.text == "📊 Наличие")
-async def check_stock(message: types.Message):
-    pool = await get_db_pool()
-    count = await pool.fetchval("SELECT COUNT(*) FROM accounts")
-    await message.answer(f"📦 В наличии: <b>{count} шт.</b>", parse_mode="HTML")
-
-@dp.message(F.text == "➕ Добавить базу")
-async def admin_add(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS: return
-    await state.set_state(AdminStates.adding_accounts)
-    await message.answer("📥 Отправьте список аккаунтов (каждый с новой строки).")
-
-@dp.message(AdminStates.adding_accounts)
-async def process_adding(message: types.Message, state: FSMContext):
-    if message.from_user.id not in ADMIN_IDS: return
-    accounts = [a.strip() for a in message.text.split('\n') if a.strip()]
+@dp.callback_query(F.data == "buy_mail")
+async def process_buy(callback: types.CallbackQuery):
+    account_data = await buy_account()
     
-    pool = await get_db_pool()
-    added_count = 0
-    async with pool.acquire() as conn:
-        for acc in accounts:
-            res = await conn.execute("INSERT INTO accounts (data) VALUES ($1) ON CONFLICT DO NOTHING", acc)
-            if res == "INSERT 0 1":
-                added_count += 1
+    if account_data:
+        await callback.message.answer(
+            f"✅ **Ваш аккаунт готов:**\n\n`{account_data}`\n\n"
+            f"Спасибо за покупку!",
+            parse_mode="Markdown"
+        )
+    else:
+        await callback.message.answer("❌ К сожалению, все почты распроданы. Зайдите позже!")
     
-    await state.clear()
-    await message.answer(f"✅ Успешно добавлено: <b>{added_count}</b> шт.", parse_mode="HTML")
+    await callback.answer() # Убираем "часики" с кнопки
+
+# Хендлер для админов (добавление почт)
+@dp.message(F.text, F.from_user.id.in_(ADMIN_IDS))
+async def admin_add_mails(message: types.Message):
+    if ":" in message.text:
+        accounts = [line.strip() for line in message.text.split('\n') if ":" in line]
+        conn = await asyncpg.connect(DB_URL)
+        await conn.executemany(
+            "INSERT INTO accounts (data) VALUES ($1) ON CONFLICT (data) DO NOTHING",
+            [(acc,) for acc in accounts]
+        )
+        count = await conn.fetchval("SELECT COUNT(*) FROM accounts WHERE is_sold = FALSE")
+        await conn.close()
+        await message.answer(f"📦 Добавлено! Сейчас в наличии: {count} шт.")
 
 async def main():
-    logging.basicConfig(level=logging.INFO)
-    await get_db_pool()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
