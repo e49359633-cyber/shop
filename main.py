@@ -1,81 +1,208 @@
 import asyncio
+import logging
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
 import asyncpg
+from decimal import Decimal
+from aiocryptopay import CryptoPay
 
-# Твои данные
+# --- НАСТРОЙКИ (ТВОИ ДАННЫЕ) ---
 API_TOKEN = '8717755678:AAFxBTzyDghHPLYOstlvkeNsUjgBStP3KHg'
-ADMIN_IDS = [8209617821, 8384467554]
-DB_URL = 'postgresql://bothost_db_29f14895d3aa:tbdVGmS3JoNrcauznAFgzNTJgefFJE3xE33flLLZY5M@node1.pghost.ru:32854/bothost_db_29f14895d3aa'
+CRYPTO_TOKEN = '552977:AAfr4bS9CTvhbqVU9s27CKLM3Ljjr6wrfLF'
+ADMIN_IDS = [8209617821, 8384467554] 
+DATABASE_URL = 'postgresql://bothost_db_29f14895d3aa:tbdVGmS3JoNrcauznAFgzNTJgefFJE3xE33flLLZY5M@node1.pghost.ru:32854/bothost_db_29f14895d3aa'
+ADMIN_USERNAME = 'ramaz666'
+
+# Цена за 1 аккаунт
+ACC_PRICE = Decimal('0.20') 
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
+crypto = CryptoPay(token=CRYPTO_TOKEN, network='mainnet')
 
-# --- Логика Базы Данных ---
+class ShopStates(StatesGroup):
+    adding_accounts = State()
+    waiting_for_amount = State()
 
-async def buy_account():
-    """Находит 1 аккаунт, помечает его как проданный и возвращает данные"""
-    conn = await asyncpg.connect(DB_URL)
-    # Используем UPDATE с RETURNING, чтобы атомарно забрать и пометить аккаунт
-    row = await conn.fetchrow('''
-        UPDATE accounts 
-        SET is_sold = TRUE 
-        WHERE id = (
-            SELECT id FROM accounts WHERE is_sold = FALSE LIMIT 1 FOR UPDATE SKIP LOCKED
-        ) 
-        RETURNING data
-    ''')
-    await conn.close()
-    return row['data'] if row else None
+db_pool = None
 
-# --- Клавиатуры ---
+async def get_db_pool():
+    global db_pool
+    if db_pool is None:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    return db_pool
 
-def get_main_kb():
-    builder = InlineKeyboardBuilder()
-    builder.row(types.InlineKeyboardButton(text="🛒 Купить почту (1 шт.)", callback_data="buy_mail"))
-    return builder.as_markup()
+async def get_user_balance(user_id):
+    pool = await get_db_pool()
+    val = await pool.fetchval("SELECT balance FROM users WHERE user_id = $1", user_id)
+    if val is None:
+        await pool.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
+        return Decimal('0.00')
+    return Decimal(str(val))
 
-# --- Хендлеры ---
+# --- ОСНОВНЫЕ КОМАНДЫ ---
 
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+async def start_cmd(message: types.Message):
+    kb = [
+        [types.KeyboardButton(text="🛒 Купить аккаунт")],
+        [types.KeyboardButton(text="📊 Наличие"), types.KeyboardButton(text="💎 Баланс")],
+        [types.KeyboardButton(text="🆘 Поддержка")]
+    ]
+    if message.from_user.id in ADMIN_IDS:
+        kb.append([types.KeyboardButton(text="➕ Добавить базу")])
+    
+    keyboard = types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+    
+    welcome_text = (
+        "🤖 <b>Система инициализирована...</b>\n\n"
+        "Добро пожаловать в защищенный узел обмена данными. "
+        "Здесь ты найдешь чистые и надежные почтовые аккаунты.\n\n"
+        f"💳 <b>Цена за 1 шт:</b> <code>{ACC_PRICE} $</code>\n"
+        f"👤 <b>Ваш ID:</b> <code>{message.from_user.id}</code>\n"
+        "🌐 <b>Status:</b> <code>Encrypted</code>\n\n"
+        "<i>Выбирай пункт назначения. Анонимность гарантирована.</i>"
+    )
+    await message.answer(welcome_text, reply_markup=keyboard, parse_mode="HTML")
+
+# --- ЛОГИКА БАЛАНСА И ОПЛАТЫ ---
+
+@dp.message(F.text == "💎 Баланс")
+async def balance_menu(message: types.Message):
+    balance = await get_user_balance(message.from_user.id)
+    builder = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="💵 Пополнить баланс", callback_data="deposit")]
+    ])
     await message.answer(
-        "👋 Привет! Добро пожаловать в магазин почт Mail.ru.\n\n"
-        "Нажми на кнопку ниже, чтобы получить аккаунт.",
-        reply_markup=get_main_kb()
+        f"💳 <b>Ваш личный счет</b>\n\n"
+        f"💰 <b>Баланс:</b> <code>{balance:.2f} $</code>\n\n"
+        "Пополнение через Crypto Bot (USDT/TON/BTC).",
+        reply_markup=builder,
+        parse_mode="HTML"
     )
 
-@dp.callback_query(F.data == "buy_mail")
-async def process_buy(callback: types.CallbackQuery):
-    account_data = await buy_account()
-    
-    if account_data:
-        await callback.message.answer(
-            f"✅ **Ваш аккаунт готов:**\n\n`{account_data}`\n\n"
-            f"Спасибо за покупку!",
-            parse_mode="Markdown"
+@dp.callback_query(F.data == "deposit")
+async def deposit_step1(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(ShopStates.waiting_for_amount)
+    await callback.message.answer("⌨️ <b>Введите сумму в $ (например: 1, 5, 10.5):</b>", parse_mode="HTML")
+    await callback.answer()
+
+@dp.message(ShopStates.waiting_for_amount)
+async def deposit_step2(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text.replace(',', '.'))
+        if amount < 0.1:
+            await message.answer("❌ Минимальная сумма пополнения: 0.1 $")
+            return
+        
+        invoice = await crypto.create_invoice(asset='USDT', amount=amount)
+        
+        builder = types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="🔗 Оплатить", url=invoice.pay_url)],
+            [types.InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_{invoice.invoice_id}_{amount}")]
+        ])
+        
+        await message.answer(
+            f"🚀 <b>Счет на {amount} $ сформирован!</b>\n\n"
+            "Оплатите его в Crypto Bot и нажмите кнопку ниже:",
+            reply_markup=builder,
+            parse_mode="HTML"
         )
+        await state.clear()
+    except Exception:
+        await message.answer("❌ Ошибка! Введите число (например: 1.5)")
+
+@dp.callback_query(F.data.startswith("check_"))
+async def check_payment_call(callback: types.CallbackQuery):
+    _, inv_id, amount = callback.data.split("_")
+    invoices = await crypto.get_invoices(invoice_ids=inv_id)
+    
+    if invoices and invoices[0].status == 'paid':
+        pool = await get_db_pool()
+        await pool.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", Decimal(amount), callback.from_user.id)
+        await callback.message.edit_text(f"✅ <b>Оплата принята!</b>\nНа ваш баланс зачислено <b>{amount} $</b>", parse_mode="HTML")
     else:
-        await callback.message.answer("❌ К сожалению, все почты распроданы. Зайдите позже!")
+        await callback.answer("⚠️ Оплата еще не обнаружена.", show_alert=True)
+
+# --- ЛОГИКА ПОКУПКИ ---
+
+@dp.message(F.text == "🛒 Купить аккаунт")
+async def buy_account(message: types.Message):
+    user_id = message.from_user.id
+    balance = await get_user_balance(user_id)
     
-    await callback.answer() # Убираем "часики" с кнопки
+    if balance < ACC_PRICE:
+        await message.answer(f"❌ <b>Недостаточно средств!</b>\nНужно: {ACC_PRICE} $\nУ вас: {balance:.2f} $", parse_mode="HTML")
+        return
 
-# Хендлер для админов (добавление почт)
-@dp.message(F.text, F.from_user.id.in_(ADMIN_IDS))
-async def admin_add_mails(message: types.Message):
-    if ":" in message.text:
-        accounts = [line.strip() for line in message.text.split('\n') if ":" in line]
-        conn = await asyncpg.connect(DB_URL)
-        await conn.executemany(
-            "INSERT INTO accounts (data) VALUES ($1) ON CONFLICT (data) DO NOTHING",
-            [(acc,) for acc in accounts]
-        )
-        count = await conn.fetchval("SELECT COUNT(*) FROM accounts WHERE is_sold = FALSE")
-        await conn.close()
-        await message.answer(f"📦 Добавлено! Сейчас в наличии: {count} шт.")
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow("DELETE FROM accounts WHERE id = (SELECT id FROM accounts ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING data")
+            
+            if row:
+                await conn.execute("UPDATE users SET balance = balance - $1 WHERE user_id = $2", ACC_PRICE, user_id)
+                await message.answer(
+                    f"✅ <b>Покупка успешна!</b>\n\n📦 <b>Данные:</b>\n<code>{row['data']}</code>\n\n"
+                    f"💰 Остаток: <code>{(balance - ACC_PRICE):.2f} $</code>",
+                    parse_mode="HTML"
+                )
+            else:
+                await message.answer("❌ Извините, товар закончился.")
 
+# --- ИНФО ---
+
+@dp.message(F.text == "📊 Наличие")
+async def check_stock(message: types.Message):
+    pool = await get_db_pool()
+    count = await pool.fetchval("SELECT COUNT(*) FROM accounts")
+    await message.answer(f"📦 В наличии: <b>{count} шт.</b>", parse_mode="HTML")
+
+@dp.message(F.text == "🆘 Поддержка")
+async def support_cmd(message: types.Message):
+    await message.answer(f"👨‍💻 <b>Support:</b> @{ADMIN_USERNAME}", parse_mode="HTML")
+
+# --- АДМИНКА ---
+
+@dp.message(Command("give"))
+async def give_balance_cmd(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS: return
+    try:
+        _, t_id, amnt = message.text.split()
+        pool = await get_db_pool()
+        await pool.execute("INSERT INTO users (user_id, balance) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET balance = users.balance + $2", int(t_id), Decimal(amnt))
+        await message.answer(f"✅ Начислено {amnt} $ юзеру {t_id}")
+    except:
+        await message.answer("Формат: /give ID СУММА")
+
+@dp.message(F.text == "➕ Добавить базу")
+async def admin_add(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    await state.set_state(ShopStates.adding_accounts)
+    await message.answer("📥 Отправь список почт (каждая с новой строки):")
+
+@dp.message(ShopStates.adding_accounts)
+async def process_adding(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    accounts = [a.strip() for a in message.text.split('\n') if a.strip()]
+    pool = await get_db_pool()
+    added = 0
+    async with pool.acquire() as conn:
+        for acc in accounts:
+            res = await conn.execute("INSERT INTO accounts (data) VALUES ($1) ON CONFLICT DO NOTHING", acc)
+            if res == "INSERT 0 1": added += 1
+    await state.clear()
+    await message.answer(f"✅ Добавлено: <b>{added}</b> шт.", parse_mode="HTML")
+
+# --- ЗАПУСК ---
 async def main():
+    logging.basicConfig(level=logging.INFO)
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        await conn.execute('CREATE TABLE IF NOT EXISTS accounts (id SERIAL PRIMARY KEY, data TEXT UNIQUE, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)')
+        await conn.execute('CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, balance DECIMAL(10,2) DEFAULT 0.00)')
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
