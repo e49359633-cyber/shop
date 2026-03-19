@@ -1,10 +1,10 @@
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher, types, F
+import asyncpg
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
-import asyncpg
 
 # --- НАСТРОЙКИ ---
 API_TOKEN = '8717755678:AAFxBTzyDghHPLYOstlvkeNsUjgBStP3KHg'
